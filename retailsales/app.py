@@ -56,35 +56,37 @@ def signup(email, password):
         return False, str(e)
 
 # ---------------- LOGIN UI ----------------
-menu = st.sidebar.selectbox("Menu", ["Login", "Signup"])
-
-if menu == "Signup":
-    st.title("Signup")
-    email = st.text_input("Email")
-    password = st.text_input("Password", type="password")
-    if st.button("Create Account"):
-        success, result = signup(email, password)
-        if success:
-            st.success("Signup request succeeded. If email confirmation is required, please check your inbox.")
-            st.write(result)
-        else:
-            st.error(f"Signup failed: {result}")
-
-elif menu == "Login":
-    st.title("Login")
-    email = st.text_input("Email")
-    password = st.text_input("Password", type="password")
-    if st.button("Login"):
-        success, result = login(email, password)
-        if success:
-            st.session_state["user"] = result.user.id
-            st.session_state["session"] = result.session
-            st.success("Login successful.")
-            st.rerun()
-        else:
-            st.error(f"Login failed: {result}")
-
 if "user" not in st.session_state:
+    menu = st.sidebar.selectbox("Menu", ["Login", "Signup"], key="menu")
+
+    if menu == "Signup":
+        st.title("Signup")
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        if st.button("Create Account"):
+            success, result = signup(email, password)
+            if success:
+                st.success("Signup request succeeded. If email confirmation is required, please check your inbox.")
+                st.write(result)
+                st.session_state["menu"] = "Login"
+                st.rerun()
+            else:
+                st.error(f"Signup failed: {result}")
+
+    elif menu == "Login":
+        st.title("Login")
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            success, result = login(email, password)
+            if success:
+                st.session_state["user"] = result.user.id
+                st.session_state["session"] = result.session
+                st.success("Login successful.")
+                st.rerun()
+            else:
+                st.error(f"Login failed: {result}")
+
     st.stop()
 
 if "session" in st.session_state:
