@@ -1,629 +1,449 @@
-import os
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from prophet import Prophet
+from sklearn.cluster import KMeans
+from groq import Groq
 from supabase import create_client
-import openai
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib import colors
 from io import BytesIO
-import uuid
+import tempfile
+from prophet import Prophet
 
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet
 
-# ---------------- CONFIG ----------------
-st.set_page_config(page_title="Retail AI SaaS", layout="wide")
+# ================= CONFIG =================
+st.set_page_config(page_title="InSightX", layout="wide")
 
-SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY") or os.environ.get("SUPABASE_KEY")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-
-
-
-if not SUPABASE_URL or not SUPABASE_KEY or not OPENAI_API_KEY:
-    st.error("Missing SUPABASE or OPENAI configuration. Set st.secrets or environment variables.")
-    st.stop()
+# 🔑 ADD YOUR KEYS HERE
+SUPABASE_URL = ""
+SUPABASE_KEY = ""
+GROQ_API_KEY = ""
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-openai.api_key = OPENAI_API_KEY
+client = Groq(api_key=GROQ_API_KEY)
 
-# ---------------- AUTH ----------------
-def login(email, password):
-    if not email or not password:
-        return False, "Please provide both email and password."
+# ================= SESSION =================
+for k in ["user", "session", "df"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+# ================= AI =================
+def ai_explain(prompt, data):
     try:
-        response = supabase.auth.sign_in_with_password({"email": email, "password": password})
-        if getattr(response, "user", None) or getattr(response, "session", None):
-            return True, response
-        return False, "Invalid credentials or user not found."
-    except Exception as e:
-        return False, str(e)
+        res = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+"You are a Retail Data Analyst.
 
-def signup(email, password):
-    if not email or not password:
-        return False, "Please provide both email and password."
-    try:
-        response = supabase.auth.sign_up({"email": email, "password": password})
-        if getattr(response, "user", None) or getattr(response, "session", None):
-            return True, response
-        return False, "Signup failed. Please check email and password."
-    except Exception as e:
-        return False, str(e)
+Rules:
+- NEVER return Python code
+- ALWAYS return final numeric answers when asked (like total sales, profit)
+- Be direct and business-friendly
+- If user asks for totals → calculate from given data summary
+- Give short answer + insight
 
-# ---------------- LOGIN UI ----------------
-if "user" not in st.session_state:
-    menu = st.sidebar.selectbox("Menu", ["Login", "Signup"], key="menu")
+Format:
+Answer: <value>
+Insight: <short business meaning>"
 
-    if menu == "Signup":
-        st.title("Signup")
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
-        if st.button("Create Account"):
-            success, result = signup(email, password)
-            if success:
-                st.success("Signup request succeeded. If email confirmation is required, please check your inbox.")
-                st.write(result)
-                st.session_state["menu"] = "Login"
-                st.rerun()
+Explain the visualization in 3 parts:
+1. Trend
+2. Retail Insight
+3. Actionable Takeaway
+
+Keep it short and professional.
+"""
+                },
+                {"role": "user", "content": f"{prompt}\n\nData:\n{data}"}
+            ]
+        )
+        return res.choices[0].message.content
+    except:
+        return "AI unavailable"
+
+# ================= LOGIN =================
+if not st.session_state["user"]:
+
+    # 🎯 ADD TITLE HERE
+    st.title("Welcome To 🚀 InSightX")
+    st.markdown("### Smart Retail Analytics & AI Insights Platform")
+    st.markdown("---")
+
+
+    mode = st.selectbox("Mode", ["Login", "Signup"])
+    email = st.text_input("Email")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Submit", key="auth_btn"):
+        try:
+            if mode == "Signup":
+                supabase.auth.sign_up({"email": email, "password": password})
+                st.success("Account created")
             else:
-                st.error(f"Signup failed: {result}")
-
-    elif menu == "Login":
-        st.title("Login")
-        email = st.text_input("Email")
-        password = st.text_input("Password", type="password")
-        if st.button("Login"):
-            success, result = login(email, password)
-            if success:
-                st.session_state["user"] = result.user.id
-                st.session_state["session"] = result.session
-                st.success("Login successful.")
+                res = supabase.auth.sign_in_with_password({
+                    "email": email,
+                    "password": password
+                })
+                st.session_state["user"] = email
+                st.session_state["session"] = res.session
                 st.rerun()
-            else:
-                st.error(f"Login failed: {result}")
+        except Exception as e:
+            st.error(str(e))
 
     st.stop()
 
-if "session" in st.session_state:
-    supabase.auth.set_session(st.session_state["session"].access_token, st.session_state["session"].refresh_token)
+# ================= FILE =================
+st.title("📊 Turn Data into Decisions Instantly")
 
-user_id = st.session_state["user"]
+file = st.file_uploader("Upload CSV")
 
-# ---------------- DATA STORAGE ----------------
-def save_dataset(file, user_id):
-    file_id = str(uuid.uuid4())
-    supabase.table("datasets").insert({
-        "id": file_id,
-        "user": user_id,
-        "filename": file.name,
-        "content": file.getvalue().decode("ISO-8859-1")
-    }).execute()
-    return file_id
+if file:
+    df = pd.read_csv(file)
+    df.columns = df.columns.str.lower()
+    st.session_state["df"] = df
 
-def load_datasets(user_id):
-    res = supabase.table("datasets").select("*").eq("user", user_id).execute()
-    return res.data
+if st.session_state["df"] is None:
+    st.stop()
 
-# ---------------- UI ----------------
-st.title("📊 AI Retail SaaS Dashboard")
+df = st.session_state["df"]
 
-uploaded_file = st.file_uploader("Upload Dataset")
+num_cols = df.select_dtypes(include="number").columns
+cat_cols = df.select_dtypes(include="object").columns
 
-if uploaded_file:
-    save_dataset(uploaded_file, user_id)
-    st.success("Dataset saved!")
+# ================= KPI =================
+total_sales = df[num_cols[0]].sum()
+total_profit = df[num_cols[1]].sum() if len(num_cols) > 1 else 0
 
-datasets = load_datasets(user_id)
+st.metric("Total Sales", total_sales)
+st.metric("Total Profit", total_profit)
 
-dataset_names = [d["filename"] for d in datasets]
+# ================= CATEGORY =================
+st.subheader("📊 Category Sales")
 
-selected = st.selectbox("Select Dataset", dataset_names)
+cat_fig = None
+if len(cat_cols) > 0:
+    cat = df.groupby(cat_cols[0])[num_cols[0]].sum().reset_index()
 
-if selected:
-    selected_data = next(d for d in datasets if d["filename"] == selected)
-    try:
-        data = pd.read_csv(pd.io.common.StringIO(selected_data["content"]))
-    except Exception as e:
-        st.error(f"Error loading dataset: {e}")
-        st.stop()
+    cat_fig = px.bar(cat, x=cat_cols[0], y=num_cols[0])
+    st.plotly_chart(cat_fig)
+
+    if st.button("Explain Category Sales", key="cat_btn_unique"):
+
+        # ✅ LIMIT DATA (CRITICAL FIX)
+        sample_data = cat.head(10).to_string()
+
+        st.info(
+            ai_explain(
+                "Bar chart showing category-wise sales performance",
+                sample_data
+            )
+        )
+
+# ================= REGION PIE =================
+st.subheader("🌍 Regional Sales Distribution")
+
+region_fig = None
+
+if "region" in df.columns and len(num_cols) > 0:
+    region_data = df.groupby("region")[num_cols[0]].sum().reset_index()
+
+    region_fig = px.pie(
+        region_data,
+        names="region",
+        values=num_cols[0],
+        title="Sales Distribution by Region"
+    )
+
+    st.plotly_chart(region_fig, use_container_width=True)
+
+    # ✅ UNIQUE BUTTON KEY (important fix)
+    if st.button("Explain Regional Sales", key="region_btn"):
+        st.info(
+            ai_explain(
+                "Pie chart showing regional sales distribution",
+                region_data.to_string()
+            )
+        )
+# ================= CORRELATION =================
+st.subheader("📉 Correlation")
+corr_fig = None
+if len(num_cols) > 1:
+    corr = df[num_cols].corr()
+    corr_fig = px.imshow(corr)
+    st.plotly_chart(corr_fig)
+
+    if st.button("Explain Correlation", key="corr_btn"):
+        st.info(ai_explain("Correlation matrix", corr.to_string()))
+
+# ================= SALES VS PROFIT =================
+st.subheader("💰 Sales vs Profit")
+sv_fig = None
+if len(cat_cols) > 0 and len(num_cols) >= 2:
+    seg = df.groupby(cat_cols[0])[[num_cols[0], num_cols[1]]].sum().reset_index()
+    sv_fig = px.scatter(seg, x=num_cols[0], y=num_cols[1], color=cat_cols[0])
+    st.plotly_chart(sv_fig)
+
+    if st.button("Explain Sales vs Profit", key="seg_btn"):
+        st.info(ai_explain("Sales vs profit scatter", seg.to_string()))
+
+# ================= FORECAST =================
+st.subheader("🔮 AI Forecast (ML Powered)")
+forecast_fig = None
+
+metric_option = st.selectbox("Select Metric", ["Sales", "Profit"])
+choice = st.selectbox("Forecast Range", ["7 Days", "30 Days", "6 Months", "1 Year"])
+
+days_map = {"7 Days":7,"30 Days":30,"6 Months":180,"1 Year":365}
+periods = days_map[choice]
+
+value_col = num_cols[0] if metric_option=="Sales" else (num_cols[1] if len(num_cols)>1 else num_cols[0])
+
+date_cols = [c for c in df.columns if "date" in c]
+
+if date_cols:
+    date_col = date_cols[0]
+    ts = df[[date_col, value_col]].copy()
+    ts[date_col] = pd.to_datetime(ts[date_col], errors="coerce")
+    ts[value_col] = pd.to_numeric(ts[value_col], errors="coerce")
+    ts = ts.dropna()
+    ts = ts.groupby(date_col, as_index=False)[value_col].sum()
+    ts.columns = ["ds", "y"]
+
+    if len(ts) >= 10:
+        model = Prophet()
+        model.fit(ts)
+
+        future = model.make_future_dataframe(periods=periods)
+        forecast = model.predict(future)
+
+        forecast_fig = px.line(forecast, x="ds", y="yhat")
+        st.plotly_chart(forecast_fig)
+
+        if st.button("Explain Forecast", key="forecast_btn"):
+            st.info(ai_explain(f"{metric_option} forecast", forecast.tail(20).to_string()))
+
+
+# ================= MONTHLY =================
+st.subheader("📅 Monthly Sales")
+
+monthly_fig = None
+
+# 🔥 AUTO DETECT DATE COLUMN
+date_cols = [col for col in df.columns if "date" in col.lower()]
+
+if len(date_cols) == 0:
+    st.warning("No date column found for monthly analysis")
 else:
-    st.stop()
+    date_col = date_cols[0]
 
-# ---------------- CLEAN ----------------
-required_columns = ["Order Date", "Sales", "Profit", "Customer ID"]
-missing_columns = [col for col in required_columns if col not in data.columns]
-if missing_columns:
-    st.error(f"Dataset missing required columns: {', '.join(missing_columns)}")
-    st.stop()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-data.dropna(inplace=True)
-data['Order Date'] = pd.to_datetime(data['Order Date'], errors='coerce')
-data = data.dropna(subset=['Order Date'])
-if data.empty:
-    st.error("Dataset has no valid order dates after parsing.")
-    st.stop()
+    monthly = df.groupby(df[date_col].dt.to_period("M"))[num_cols[0]].sum().reset_index()
+    monthly[date_col] = monthly[date_col].astype(str)
 
-# ---------------- KPI ----------------
-col1, col2, col3 = st.columns(3)
-col1.metric("Sales", int(data['Sales'].sum()))
-col2.metric("Profit", int(data['Profit'].sum()))
-col3.metric("Orders", len(data))
+    monthly_fig = px.bar(monthly, x=date_col, y=num_cols[0], title="Monthly Sales")
 
-# ---------------- TIME SERIES ----------------
-data['month'] = data['Order Date'].dt.month
-data['year'] = data['Order Date'].dt.year
-monthly_sales = data.groupby(['year','month'])['Sales'].sum().reset_index()
+    st.plotly_chart(monthly_fig, use_container_width=True)
 
-fig = px.line(monthly_sales, x="month", y="Sales", color="year")
-st.plotly_chart(fig)
+    # ✅ EXPLAIN BUTTON
+    if st.button("Explain Monthly", key="monthly_btn"):
+        st.info(ai_explain("Monthly sales trend", monthly.to_string()))
 
-# ---------------- FORECAST ----------------
-# ---------------- ELITE FORECAST ENGINE ----------------
-st.header("🚀 Smart AutoML Forecasting Engine")
+# ================= TREEMAP =================
+st.subheader("📊 Profitability by Category & Sub-Category")
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.seasonal import seasonal_decompose
-from prophet import Prophet
+treemap_fig = None
+if len(cat_cols) >= 2 and len(num_cols) >= 2:
+    treemap_fig = px.treemap(
+        df,
+        path=[cat_cols[0], cat_cols[1]],
+        values=num_cols[0],  # Sales
+        color=num_cols[1],   # Profit
+        title="Sales Size vs Profit Color"
+    )
+    st.plotly_chart(treemap_fig, use_container_width=True)
 
-# Prepare data
-ts_data = data[['Order Date', 'Sales']].copy()
-ts_data = ts_data.sort_values('Order Date')
+    if st.button("Explain Treemap", key="tree_btn"):
+        st.info(ai_explain(
+            "Treemap showing category and sub-category sales vs profit",
+            df[[cat_cols[0], cat_cols[1], num_cols[0], num_cols[1]]].head().to_string()
+        ))
 
-# Train-test split
-train_size = int(len(ts_data) * 0.8)
-train = ts_data[:train_size]
-test = ts_data[train_size:]
+# ================= SHIPPING =================
+st.subheader("🚚 Shipping Efficiency")
 
-results = {}
+ship_fig = None
 
-# ---------------- PROPHET ----------------
-try:
-    prophet_train = train.rename(columns={'Order Date':'ds','Sales':'y'})
-    model_p = Prophet(interval_width=0.95)
-    model_p.fit(prophet_train)
+date_cols = [col for col in df.columns if "date" in col]
 
-    future = model_p.make_future_dataframe(periods=len(test))
-    forecast_p = model_p.predict(future)
+if len(date_cols) >= 2:
+    order_col = date_cols[0]
+    ship_col = date_cols[1]
 
-    y_pred_p = forecast_p['yhat'][-len(test):].values
-    rmse_p = np.sqrt(mean_squared_error(test['Sales'], y_pred_p))
+    temp = df[[order_col, ship_col]].copy()
+    temp[order_col] = pd.to_datetime(temp[order_col], errors="coerce")
+    temp[ship_col] = pd.to_datetime(temp[ship_col], errors="coerce")
 
-    results["Prophet"] = {
-        "pred": y_pred_p,
-        "rmse": rmse_p,
-        "model": model_p,
-        "forecast": forecast_p
-    }
-except:
-    pass
+    temp["lead_time"] = (temp[ship_col] - temp[order_col]).dt.days
 
-# ---------------- ARIMA ----------------
-try:
-    model_a = ARIMA(train['Sales'], order=(5,1,2))
-    model_a_fit = model_a.fit()
+    ship_data = df.copy()
+    ship_data["lead_time"] = temp["lead_time"]
 
-    y_pred_a = model_a_fit.forecast(steps=len(test))
-    rmse_a = np.sqrt(mean_squared_error(test['Sales'], y_pred_a))
+    ship_avg = ship_data.groupby("ship mode")["lead_time"].mean().reset_index()
 
-    results["ARIMA"] = {
-        "pred": y_pred_a,
-        "rmse": rmse_a
-    }
-except:
-    pass
+    ship_fig = px.bar(ship_avg, x="ship mode", y="lead_time", title="Avg Shipping Time")
+    st.plotly_chart(ship_fig, use_container_width=True)
 
-# ---------------- RANDOM FOREST ----------------
-try:
-    rf_data = ts_data.copy()
-    rf_data['month'] = rf_data['Order Date'].dt.month
-    rf_data['year'] = rf_data['Order Date'].dt.year
+    if st.button("Explain Shipping Efficiency", key="ship_btn"):
+        st.info(ai_explain("Shipping lead time analysis", ship_avg.to_string()))
 
-    X = rf_data[['month','year']]
-    y = rf_data['Sales']
+# ================= SEGMENT PIE =================
+st.subheader("👥 Customer Segment Distribution")
 
-    X_train, X_test = X[:train_size], X[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
+segment_fig = None
 
-    model_rf = RandomForestRegressor(n_estimators=200)
-    model_rf.fit(X_train, y_train)
+if "segment" in df.columns:
+    seg_data = df.groupby("segment")[num_cols[0]].sum().reset_index()
 
-    y_pred_rf = model_rf.predict(X_test)
-    rmse_rf = np.sqrt(mean_squared_error(y_test, y_pred_rf))
+    segment_fig = px.pie(seg_data, names="segment", values=num_cols[0])
+    st.plotly_chart(segment_fig, use_container_width=True)
 
-    results["Random Forest"] = {
-        "pred": y_pred_rf,
-        "rmse": rmse_rf
-    }
-except:
-    pass
+    if st.button("Explain Segment Distribution", key="segpie_btn"):
+        st.info(ai_explain("Customer segment revenue share", seg_data.to_string()))
 
-if not results:
-    st.error("Forecasting failed: no model produced valid predictions. Check dataset size/format and package installation.")
-    st.stop()
+# ================= GEO MAP =================
+st.subheader("🌍 Geographical Sales Map")
 
-# ---------------- MODEL COMPARISON ----------------
-st.subheader("📊 Model Performance")
+geo_fig = None
 
-rmse_df = pd.DataFrame([
-    {"Model": k, "RMSE": v["rmse"]}
-    for k,v in results.items()
-])
+if "city" in df.columns and "sales" in df.columns:
+    geo_data = df.groupby("city")["sales"].sum().reset_index()
 
-import plotly.express as px
-fig_rmse = px.bar(rmse_df, x="Model", y="RMSE", color="Model",
-                 title="Model Accuracy (Lower RMSE = Better)")
-st.plotly_chart(fig_rmse)
-
-# ---------------- BEST MODEL ----------------
-best_model = min(results.items(), key=lambda x: x[1]["rmse"])
-best_name = best_model[0]
-best_data = best_model[1]
-
-st.success(f"🏆 Best Model Selected: {best_name}")
-
-# ---------------- FORECAST VISUAL ----------------
-fig_compare = px.line(title="Forecast Comparison")
-
-fig_compare.add_scatter(y=test['Sales'].values, mode='lines', name='Actual')
-
-for name, val in results.items():
-    fig_compare.add_scatter(y=val["pred"], mode='lines', name=name)
-
-st.plotly_chart(fig_compare)
-
-# ---------------- CONFIDENCE INTERVAL (PROPHET ONLY) ----------------
-if best_name == "Prophet":
-    st.subheader("📉 Forecast Confidence Interval")
-
-    fig_ci = px.line(best_data["forecast"], x="ds", y="yhat",
-                     title="Forecast with Confidence Interval")
-
-    fig_ci.add_scatter(
-        x=best_data["forecast"]["ds"],
-        y=best_data["forecast"]["yhat_upper"],
-        mode='lines',
-        name='Upper Bound',
-        line=dict(dash='dot')
+    geo_fig = px.scatter_geo(
+        geo_data,
+        locations="city",
+        locationmode="country names",
+        size="sales",
+        title="Sales by City"
     )
 
-    fig_ci.add_scatter(
-        x=best_data["forecast"]["ds"],
-        y=best_data["forecast"]["yhat_lower"],
-        mode='lines',
-        name='Lower Bound',
-        line=dict(dash='dot')
-    )
+    st.plotly_chart(geo_fig, use_container_width=True)
 
-    st.plotly_chart(fig_ci)
+    if st.button("Explain Geography", key="geo_btn"):
+        st.info(ai_explain("Geographical sales distribution", geo_data.to_string()))
 
-# ---------------- SEASONAL DECOMPOSITION ----------------
-st.subheader("📊 Time Series Decomposition")
 
-try:
-    decomposition = seasonal_decompose(ts_data['Sales'], model='additive', period=12)
 
-    fig_decomp = px.line(title="Trend / Seasonality")
+# ================= AI CHATBOT =================
+st.subheader("🤖 AI Chatbot (Ask Your Data)")
 
-    fig_decomp.add_scatter(y=decomposition.trend, name="Trend")
-    fig_decomp.add_scatter(y=decomposition.seasonal, name="Seasonality")
-    fig_decomp.add_scatter(y=decomposition.resid, name="Residual")
+# store chat history
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
 
-    st.plotly_chart(fig_decomp)
-except:
-    st.warning("Not enough data for decomposition")
+user_query = st.text_input("Ask something about your dataset")
 
-# ---------------- AI EXPLANATION ----------------
-st.subheader("🤖 AI Insight on Forecast")
+if st.button("Ask AI", key="chat_btn"):
 
-def explain_model(results):
-    summary = "\n".join([f"{k}: RMSE={v['rmse']}" for k,v in results.items()])
-    
-    prompt = f"""
-    These are forecasting model results:
-    {summary}
+    if user_query:
 
-    Explain:
-    - Which model is best
-    - Why it performed better
-    - Business implications
-    """
+        # 🔥 CONTEXT FOR AI
+        context = f"""
+Columns: {list(df.columns)}
 
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}]
-        )
-        return response.choices[0].message.content
-    except openai.RateLimitError:
-        return "⚠️ OpenAI quota exceeded. Please check your OpenAI billing at https://platform.openai.com/account/billing and add credits to continue using AI features."
-    except Exception as e:
-        return f"AI analysis unavailable: {str(e)}"
+Sample Data:
+{df.head(5).to_string()}
 
-if st.button("Explain Results"):
-    with st.spinner("AI analyzing..."):
-        explanation = explain_model(results)
-        st.info(explanation)
+Stats:
+{df.describe().to_string()}
+"""
 
-# ---------------- CLUSTER ----------------
-customer = data.groupby('Customer ID').agg({'Sales':'sum','Profit':'sum'}).reset_index()
+        answer = ai_explain(user_query, context)
 
-scaler = StandardScaler()
-X = scaler.fit_transform(customer[['Sales','Profit']])
+        # save history
+        st.session_state["chat_history"].append(("You", user_query))
+        st.session_state["chat_history"].append(("AI", answer))
 
-kmeans = KMeans(n_clusters=3)
-customer['Cluster'] = kmeans.fit_predict(X)
+# ================= SHOW CHAT =================
+for role, msg in st.session_state["chat_history"]:
+    if role == "You":
+        st.markdown(f"**🧑 You:** {msg}")
+    else:
+        st.markdown(f"**🤖 AI:** {msg}")
 
-fig3 = px.scatter(customer, x="Sales", y="Profit", color="Cluster")
-st.plotly_chart(fig3)
 
-# ---------------- GPT ANOMALY DETECTION ----------------
-st.header("🧠 AI Anomaly Detection")
+# ================= PDF =================
+def fig_to_img(fig):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    fig.write_image(tmp.name)
+    return tmp.name
 
-def detect_anomalies(data):
-    sample = data.describe().to_string()
-
-    prompt = f"""
-    Analyze this business data summary:
-    {sample}
-
-    Find anomalies, unusual trends, or risks.
-    """
-
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}]
-        )
-        return response.choices[0].message.content
-    except openai.RateLimitError:
-        return "⚠️ OpenAI quota exceeded. Please check your OpenAI billing at https://platform.openai.com/account/billing and add credits to continue using AI features."
-    except Exception as e:
-        return f"AI analysis unavailable: {str(e)}"
-
-if st.button("Detect Anomalies"):
-    with st.spinner("Analyzing..."):
-        result = detect_anomalies(data)
-        st.warning(result)
-
-# ---------------- AI CHAT ----------------
-st.header("🤖 AI Chatbot")
-
-question = st.text_input("Ask about your data")
-
-def ask_ai(data, q):
-    sample = data.head(50).to_csv()
-
-    prompt = f"""
-    Data:
-    {sample}
-
-    Question: {q}
-    """
-
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}]
-        )
-        return response.choices[0].message.content
-    except openai.RateLimitError:
-        return "⚠️ OpenAI quota exceeded. Please check your OpenAI billing at https://platform.openai.com/account/billing and add credits to continue using AI features."
-    except Exception as e:
-        return f"AI analysis unavailable: {str(e)}"
-
-if st.button("Ask"):
-    st.info(ask_ai(data, question))
-
-# ---------------- PDF REPORT ----------------
-st.header("🧾 Generate Report")
-
-def create_pdf(data, results, best_model, customer_clusters):
+def generate_pdf(metric_option, choice):
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    doc = SimpleDocTemplate(buffer)
     styles = getSampleStyleSheet()
-
-    # Custom styles
-    title_style = ParagraphStyle(
-        'Title',
-        parent=styles['Heading1'],
-        fontSize=18,
-        spaceAfter=30,
-        alignment=1  # Center
-    )
-
-    heading_style = ParagraphStyle(
-        'Heading',
-        parent=styles['Heading2'],
-        fontSize=14,
-        spaceAfter=15,
-        textColor=colors.darkblue
-    )
-
-    normal_style = styles['Normal']
-
     story = []
 
-    # Title
-    story.append(Paragraph("Retail Sales Analytics Report", title_style))
-    story.append(Spacer(1, 12))
+    story.append(Paragraph("Retail AI Report", styles["Title"]))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(f"Total Sales: {total_sales}", styles["Normal"]))
+    story.append(Paragraph(f"Total Profit: {total_profit}", styles["Normal"]))
 
-    # Executive Summary
-    story.append(Paragraph("Executive Summary", heading_style))
-    story.append(Paragraph(f"Report Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}", normal_style))
-    story.append(Paragraph(f"Dataset Records: {len(data)}", normal_style))
-    story.append(Paragraph(f"Date Range: {data['Order Date'].min()} to {data['Order Date'].max()}", normal_style))
-    story.append(Spacer(1, 12))
-
-    # Key Metrics
-    story.append(Paragraph("Key Performance Metrics", heading_style))
-    metrics_data = [
-        ["Metric", "Value"],
-        ["Total Sales", f"USD {data['Sales'].sum():,.2f}"],
-        ["Total Profit", f"USD {data['Profit'].sum():,.2f}"],
-        ["Average Order Value", f"USD {data['Sales'].mean():,.2f}"],
-        ["Profit Margin", f"{(data['Profit'].sum() / data['Sales'].sum() * 100):,.1f}%"],
-        ["Total Customers", str(data['Customer ID'].nunique())]
+    charts = [
+        ("Category", cat_fig, "Category sales"),
+        ("Regional Sales", region_fig, "Sales distribution across regions"),
+        ("Correlation", corr_fig, "Correlation"),
+        ("Sales vs Profit", sv_fig, "Segmentation"),
+        ("Forecast", forecast_fig, f"{metric_option} forecast for {choice}"),
+        ("Monthly", monthly_fig, "Monthly sales"),
+        ("Treemap", treemap_fig, "Category vs sub-category profitability"),
+        ("Shipping Efficiency", ship_fig, "Shipping lead time analysis"),
+        ("Segment Distribution", segment_fig, "Customer segment revenue"),
+        ("Geographical Map", geo_fig, "Sales distribution by city")
     ]
 
-    metrics_table = Table(metrics_data)
-    metrics_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 14),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(metrics_table)
-    story.append(Spacer(1, 12))
+    for title, fig, desc in charts:
+        if fig:
+            story.append(Spacer(1, 10))
+            story.append(Paragraph(title, styles["Heading2"]))
+            img = fig_to_img(fig)
+            story.append(Image(img, width=400, height=250))
 
-    # Forecasting Results
-    if results:
-        story.append(Paragraph("Sales Forecasting Analysis", heading_style))
-        story.append(Paragraph(f"Best Performing Model: {best_model[0]} (RMSE: {best_model[1]['rmse']:.2f})", normal_style))
-        story.append(Spacer(1, 6))
-
-        # Model Comparison Table
-        model_data = [["Model", "RMSE Score"]]
-        for model_name, model_data_item in results.items():
-            model_data.append([model_name, f"{model_data_item['rmse']:.2f}"])
-
-        model_table = Table(model_data)
-        model_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        story.append(model_table)
-        story.append(Spacer(1, 12))
-
-    # Customer Segmentation
-    if not customer_clusters.empty:
-        story.append(Paragraph("Customer Segmentation Analysis", heading_style))
-
-        cluster_summary = customer_clusters.groupby('Cluster').agg({
-            'Sales': 'sum',
-            'Profit': 'sum',
-            'Customer ID': 'count'
-        }).round(2)
-
-        cluster_data = [["Cluster", "Customers", "Total Sales", "Total Profit"]]
-        for cluster_id, row in cluster_summary.iterrows():
-            cluster_data.append([
-                f"Cluster {cluster_id}",
-                str(int(row['Customer ID'])),
-                f"USD {row['Sales']:,.2f}",
-                f"USD {row['Profit']:,.2f}"
-            ])
-
-        cluster_table = Table(cluster_data)
-        cluster_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        story.append(cluster_table)
-        story.append(Spacer(1, 12))
-
-    # Top Products
-    story.append(Paragraph("Top Performing Products", heading_style))
-    top_products = data.groupby('Product Name').agg({
-        'Sales': 'sum',
-        'Quantity': 'sum'
-    }).sort_values('Sales', ascending=False).head(5)
-
-    product_data = [["Rank", "Product", "Sales", "Quantity"]]
-    for idx, (product, row) in enumerate(top_products.iterrows(), 1):
-        product_data.append([
-            str(idx),
-            str(product)[:50],  # Truncate long names
-            f"USD {row['Sales']:,.2f}",
-            str(int(row['Quantity']))
-        ])
-
-    product_table = Table(product_data, colWidths=[40, 200, 80, 60])
-    product_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('ALIGN', (1, 1), (1, -1), 'LEFT'),  # Left align product names
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(product_table)
-    story.append(Spacer(1, 12))
-
-    # Regional Performance
-    story.append(Paragraph("Regional Performance", heading_style))
-    region_perf = data.groupby('Region').agg({
-        'Sales': 'sum',
-        'Profit': 'sum'
-    }).sort_values('Sales', ascending=False)
-
-    region_data = [["Region", "Sales", "Profit"]]
-    for region, row in region_perf.iterrows():
-        region_data.append([
-            str(region),
-            f"USD {row['Sales']:,.2f}",
-            f"USD {row['Profit']:,.2f}"
-        ])
-
-    region_table = Table(region_data)
-    region_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(region_table)
-    story.append(Spacer(1, 12))
-
-    # Recommendations
-    story.append(Paragraph("Key Recommendations", heading_style))
-    recommendations = [
-        "Focus on high-performing products and regions",
-        "Implement targeted marketing for different customer segments",
-        "Monitor forecast accuracy and adjust models quarterly",
-        "Consider inventory optimization based on demand patterns"
-    ]
-
-    for rec in recommendations:
-        story.append(Paragraph(f"• {rec}", normal_style))
+            explanation = ai_explain(desc, df.describe().to_string())
+            story.append(Paragraph(explanation.replace("\n","<br/>"), styles["Normal"]))
 
     doc.build(story)
     buffer.seek(0)
-    return buffer.getvalue()
+    return buffer
 
-if st.button("Generate PDF"):
-    pdf_bytes = create_pdf(data, results, best_model, customer)
-    st.download_button("Download PDF", pdf_bytes, file_name="retail_analytics_report.pdf")
 
-# ---------------- REAL-TIME REFRESH ----------------
-st.sidebar.header("Live Mode")
+# ================= DOWNLOAD =================
 
-if st.sidebar.button("Refresh Data"):
-    st.rerun()
+if "pdf_ready" not in st.session_state:
+    st.session_state["pdf_ready"] = None
 
-# ---------------- STYLE ----------------
-st.markdown("""
-<style>
-body {
-    background-color: #0E1117;
-    color: white;
-}
-</style>
-""", unsafe_allow_html=True)
+# STEP 1: Generate
+if st.button("Generate Report", key="gen_btn"):
+    try:
+        with st.spinner("Generating AI Report..."):
+            pdf = generate_pdf(metric_option, choice)
+
+            st.session_state["pdf_ready"] = pdf
+            st.success("✅ Report Ready!")
+
+    except Exception as e:
+        st.error(f"❌ Failed: {e}")
+
+# STEP 2: Download (ONLY if ready)
+if st.session_state["pdf_ready"] is not None:
+    st.download_button(
+        label="📄 Download Full AI Report",
+        data=st.session_state["pdf_ready"],
+        file_name="Retail_AI_Report.pdf",
+        mime="application/pdf",
+        key="download_pdf"
+    )
